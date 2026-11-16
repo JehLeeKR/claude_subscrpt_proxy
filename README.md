@@ -1,116 +1,162 @@
-# claude_subscrpt_proxy
+# ccpool: Claude Team seat pool
 
-A central holder for several Claude subscription logins. It spreads Claude Code
-usage across those accounts by remaining quota and reset time.
+ccpool keeps several Claude **Team** seats logged in and spreads Claude Code
+traffic across them by remaining quota and reset time.
 
-> **Status:** design draft. No code yet.
+Each seat is held by its own **holder** process, usually one container per
+seat. The holder logs in **once** and keeps that login alive by refreshing it
+in the background. It never logs in again per request. Claude Code talks to one
+**router**. For each request the router picks a seat, and the holder for that
+seat forwards the request with the seat's credential attached.
 
-## Why this works
-
-A Claude Code session keeps all of its context (conversation, tool state,
-working directory) on the client side. The account only decides **whose quota
-pays for the next request**. If you switch credentials between requests, the
-session carries on and only the billing target changes. You can already see this
-by running `/login` with a different account in the middle of a session.
-
-This project automates that switch and decides when to make it.
-
-## ⚠️ Terms-of-service risk (read first)
-
-Anthropic's consumer subscriptions (Pro/Max) are licensed per individual.
-Pooling several subscriptions to get around per-account usage limits, or
-sharing logins between people or machines, may break the Consumer Terms and
-Usage Policy. It can get the accounts suspended. Anthropic has also acted
-against tools that send subscription OAuth tokens through non-first-party
-paths. Before using this with consumer accounts, check the current terms.
-
-The same architecture is clearly allowed with:
-
-- **API keys** (Console / Bedrock / Vertex): load-balancing across your own
-  org's keys and workspaces is normal practice.
-- **Team / Enterprise** seats, where your organization administers the usage.
-
-The design below treats the credential type as pluggable (`oauth` | `api_key`),
-so the tool works in the clearly allowed mode as well.
-
-## Architecture
+A Claude Code session keeps its whole context on the client, so switching seats
+between requests loses nothing. Only the seat whose quota pays for the next
+request changes, just as when you `/login` to another account mid-session.
 
 ```
- ┌───────────────┐   ANTHROPIC_BASE_URL=http://pool:8787
- │ Claude Code   │ ───────────────────────────────┐
- │ (container A) │                                │
- └───────────────┘                                ▼
- ┌───────────────┐                     ┌─────────────────────┐      ┌──────────────────┐
- │ Claude Code   │ ──────────────────▶ │  pool proxy         │ ───▶ │ api.anthropic.com│
- │ (container B) │                     │  - credential store │ ◀─── │                  │
- └───────────────┘                     │  - quota tracker    │      └──────────────────┘
-                                       │  - scheduler        │
-                                       │  - token refresher  │
-                                       └─────────────────────┘
+ Claude Code (container 1) ─┐  ANTHROPIC_BASE_URL=http://router:8787
+ Claude Code (container 2) ─┼──────────────▶ ┌──────────┐
+ Claude Code (container N) ─┘  ANTHROPIC_AUTH │  router  │  picks a seat per request
+                               _TOKEN=poolkey └────┬─────┘  (quota, stickiness, failover)
+                                    ┌──────────────┼──────────────┐   internal key
+                                    ▼              ▼              ▼
+                               ┌─────────┐    ┌─────────┐    ┌─────────┐
+                               │ holder  │    │ holder  │    │ holder  │  one login each,
+                               │ seat-a  │    │ seat-b  │    │ seat-c  │  kept fresh
+                               └────┬────┘    └────┬────┘    └────┬────┘
+                                    └──────────────┼──────────────┘
+                                                   ▼
+                                           api.anthropic.com
 ```
 
-### Integration modes
+## What each part does
 
-| Mode | How it works | Switches mid-session | Notes |
-|---|---|---|---|
-| **A. Reverse proxy** (main) | Clients set `ANTHROPIC_BASE_URL` to the pool. For each request, the pool swaps the `Authorization` header for the chosen account's token and forwards the request with SSE streaming. | Yes, per request | Reads quota headers from every response, so it needs no polling. One pool serves many containers. |
-| **B. Credential-file sync** | A sidecar rewrites `~/.claude/.credentials.json` (Linux) inside each container when the target account changes. | When Claude Code next reads the file | Doesn't touch traffic. Depends on Claude Code's re-read behaviour, which needs testing. |
-| **C. Env token** | Each launch gets `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`) or `ANTHROPIC_API_KEY`. | No, set at launch | Simplest. Fits short-lived or batch containers. |
+**Holder** (`ccpool holder`):
+- Holds one seat's login, either a `.credentials.json` from a normal Claude Code
+  login or a long-lived token from `claude setup-token`.
+- Refreshes the OAuth access token before it expires, including while idle.
+  Rotated refresh tokens are written back to the file atomically, so the login
+  survives restarts.
+- Forwards Claude Code's request body as-is (context, tools, system prompt) and
+  streams the reply back. It swaps only the `Authorization` header and adds the
+  `oauth-2025-04-20` beta flag.
+- If the API answers `401`, it refreshes once and retries.
+- Reads the quota headers on every response and reports them at
+  `/_ccpool/status`. The status shows no secrets.
+- Accepts requests only from the router, which must present the internal key.
 
-### Quota tracking
+**Router** (`ccpool router`):
+- **Scoring:** `headroom + 0.3 × expiring`.
+  - `headroom` is `1 − max(5h use, 7d use)`.
+  - `expiring` is unused 5h quota whose window resets soon. Spending it first
+    means quota that would be lost anyway is used before quota that carries over.
+  - A window whose reset time has passed counts as empty.
+- **Stickiness:** a Claude Code session stays on its seat until that seat passes
+  `--switch-threshold` (default 90% of either window). Sessions are identified
+  by `metadata.user_id` in the request body, by a session header, or by client
+  IP.
+- **Failover:** on `429`, `401`, `502`, `503` or an unreachable holder, the same
+  request is retried on the next seat. Nothing has reached the client at that
+  point, so the client never sees the failure.
+- **All seats exhausted:** it returns `429` with `retry-after` set to the moment
+  the first seat frees up. Claude Code shows this as a normal rate limit.
+- **Admin:** `GET /_ccpool/status`, plus
+  `POST /_ccpool/holders/<name>/{drain,enable}` to take a seat out of rotation
+  or put it back.
 
-Subscription responses carry unified rate-limit headers. These were observed
-from Claude Code traffic, are not a documented API, and need checking against
-live traffic:
+## Quick start (Docker)
 
-- `anthropic-ratelimit-unified-status` (`allowed` / `allowed_warning` / `rejected`)
-- `anthropic-ratelimit-unified-5h-utilization`, `…-5h-reset`
-- `anthropic-ratelimit-unified-7d-utilization`, `…-7d-reset`
-- `anthropic-ratelimit-unified-representative-claim`
+### 1. Log in each seat once
 
-API keys get the documented `anthropic-ratelimit-*` headers (requests, input
-tokens, output tokens) instead. A `429` marks the account as cooling down until
-its reset time.
+On any machine with Claude Code, give each seat its own config directory:
 
-### Scheduling policy
+```bash
+mkdir -p deploy/seats/seat-a
+CLAUDE_CONFIG_DIR=$PWD/deploy/seats/seat-a claude    # then /login as seat A's member, then exit
+# repeat for seat-b, seat-c …
+```
 
-For each request, score every healthy account and pick the best one:
+This leaves `deploy/seats/<seat>/.credentials.json`. From then on, that file
+belongs to its holder. **Don't use the same login anywhere else.** The refresh
+token rotates on every refresh, so two users of one login keep logging each
+other out.
+
+On macOS, Claude Code stores the login in the Keychain rather than in a file.
+There, use a token instead: run `claude setup-token`, then start the holder with
+`--token-file`.
+
+### 2. Start the pool
+
+```bash
+cd deploy
+cp .env.example .env        # set CCPOOL_POOL_KEY and CCPOOL_INTERNAL_KEY to random strings
+docker compose up -d
+```
+
+To add or remove seats, edit the holder services and the router's `--holder`
+lines in `docker-compose.yml`.
+
+### 3. Point Claude Code at it
+
+In each Claude Code container:
+
+```bash
+export ANTHROPIC_BASE_URL=http://<router-host>:8787
+export ANTHROPIC_AUTH_TOKEN=<CCPOOL_POOL_KEY>
+claude
+```
+
+### 4. Watch it
+
+```bash
+CCPOOL_POOL_KEY=... ccpool status --url http://<router-host>:8787
+```
 
 ```
-headroom   = 1 - max(util_5h, util_7d * w7d)
-urgency    = how soon unused quota expires   (use quota that resets soon first)
-score      = headroom + α·urgency − β·recent_switch_penalty
+HOLDER        STATE        5H   RESET    7D    RESET  SCORE  SERVED
+seat-a        ok          34%   2h10m   22%   4h03m   0.66     118
+seat-b        ok          71%   0h25m   40%  51h12m   0.37      64
+seat-c        cooling    100%   1h02m   58%  80h40m      -      90
 ```
 
-- **Session stickiness:** keep one Claude Code session on one account (keyed on
-  `x-claude-code-session-id` or the client's IP/container) until the account
-  passes a utilization threshold. Switching often adds nothing and is easy to
-  spot.
-- **Failover:** on a `429` or a `rejected` status, retry the same request once
-  on the next-best account.
-- **Strategies:** `least-utilized` (default), `drain-expiring-first`, `round-robin`.
+## Without Docker
 
-### Credential store
+```bash
+pip install -e .
+export CCPOOL_INTERNAL_KEY=... CCPOOL_POOL_KEY=...
+ccpool holder --name seat-a --oauth-file seats/seat-a/.credentials.json --port 8801 &
+ccpool holder --name seat-b --token-file seats/seat-b/token --port 8802 &
+ccpool router --holder seat-a=http://localhost:8801 --holder seat-b=http://localhost:8802
+```
 
-- Supported backends: in-memory, an encrypted file (age or libsodium, key from
-  env), or a mounted Docker secret.
-- Each account record holds its id, label, type (`oauth` | `api_key`), access
-  token, refresh token, `expiresAt`, and its last quota snapshot.
-- A background job refreshes OAuth access tokens before they expire.
-- Tokens never appear in logs. The admin API shows them redacted.
+## Development
 
-### Admin API / CLI
+```bash
+pip install -e '.[test]'
+pytest
+```
 
-- `pool add --label work-max --from ~/.claude/.credentials.json`
-- `pool list` lists accounts with 5h and 7d utilization and reset times.
-- `pool drain <id>` / `pool enable <id>`
-- `GET /metrics` exposes Prometheus metrics.
+The tests run the router, the holders, a fake API, and a fake token endpoint in
+one process. They cover:
+- the credential swap and streaming
+- choosing a seat and staying on it
+- failover on 429 and the response when every seat is exhausted
+- refreshing the OAuth token on 401 and rewriting the file
+- the scoring rules
 
-## Open decisions
+## Caveats
 
-1. Language: Go (single static binary, good streaming proxy) or Python
-   (asyncio + httpx, faster to iterate)?
-2. Credential types for v1: OAuth subscriptions, API keys, or both?
-3. Deployment: one central pool container on a Docker network, or one sidecar
-   per workspace?
-4. Pool access control: a shared bearer token, mTLS, or local network only?
+- **Undocumented behaviour:** the quota headers (`anthropic-ratelimit-unified-*`)
+  and the OAuth refresh endpoint and client id are what Claude Code uses today.
+  None of them is a documented API. You can override the endpoint and client id
+  with `CCPOOL_OAUTH_TOKEN_URL` and `CCPOOL_OAUTH_CLIENT_ID`. Check both against
+  real traffic before you rely on the pool.
+- **Terms:** Team seats are assigned to named members. Pooling them should stay
+  within what your organization's agreement with Anthropic allows. Check with
+  your Team admin.
+- **Router state:** the router keeps session assignments in memory. Restarting
+  it only means sessions get assigned again; no context is lost, because context
+  lives in Claude Code.
+- **Network:** traffic between the router and the holders is plain HTTP, so keep
+  the holders on a private network. Put TLS in front of the router if clients
+  reach it over an untrusted network.

@@ -1,0 +1,49 @@
+# One router plus one holder per Team seat.
+#
+# Before the first start, log each seat in once (see README, "Logging in a seat"),
+# which leaves ./seats/<name>/.credentials.json behind. Then:
+#
+#   cp .env.example .env   # set CCPOOL_POOL_KEY and CCPOOL_INTERNAL_KEY
+#   docker compose up -d
+#
+# Holders publish no ports: only the router can reach them.
+
+x-holder: &holder
+  build: ..
+  restart: unless-stopped
+  environment:
+    CCPOOL_INTERNAL_KEY: ${CCPOOL_INTERNAL_KEY:?set in .env}
+  networks: [pool]
+
+services:
+  router:
+    build: ..
+    restart: unless-stopped
+    command: >
+      router
+      --holder seat-a=http://seat-a:8801
+      --holder seat-b=http://seat-b:8801
+      --holder seat-c=http://seat-c:8801
+    environment:
+      CCPOOL_POOL_KEY: ${CCPOOL_POOL_KEY:?set in .env}
+      CCPOOL_INTERNAL_KEY: ${CCPOOL_INTERNAL_KEY:?set in .env}
+    ports: ["8787:8787"]
+    networks: [pool]
+
+  seat-a:
+    <<: *holder
+    command: holder --name seat-a --oauth-file /seat/.credentials.json
+    volumes: ["./seats/seat-a:/seat"]
+
+  seat-b:
+    <<: *holder
+    command: holder --name seat-b --oauth-file /seat/.credentials.json
+    volumes: ["./seats/seat-b:/seat"]
+
+  seat-c:
+    <<: *holder
+    command: holder --name seat-c --oauth-file /seat/.credentials.json
+    volumes: ["./seats/seat-c:/seat"]
+
+networks:
+  pool: {}
