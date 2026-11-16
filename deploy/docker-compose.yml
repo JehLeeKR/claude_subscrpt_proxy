@@ -1,17 +1,17 @@
-# One router plus one holder per Team seat.
+# Router + one holder per backend: three Team seats, then API key, Bedrock and
+# LiteLLM as paid fallbacks. Delete the services you don't use, and their
+# [[backend]] entries in router.toml.
 #
-# Before the first start, log each seat in once (see README, "Logging in a seat"),
-# which leaves ./seats/<name>/.credentials.json behind. Then:
+#   cp .env.example .env      # fill in the keys
+#   # log in each seat once: see README "Logging in a seat"
+#   docker compose up -d --build
 #
-#   cp .env.example .env   # set CCPOOL_POOL_KEY and CCPOOL_INTERNAL_KEY
-#   docker compose up -d
-#
-# Holders publish no ports: only the router can reach them.
+# Only the router publishes a port; holders are reachable only on the pool network.
 
 x-holder: &holder
   build: ..
   restart: unless-stopped
-  environment:
+  environment: &holder-env
     CCPOOL_INTERNAL_KEY: ${CCPOOL_INTERNAL_KEY:?set in .env}
   networks: [pool]
 
@@ -19,31 +19,55 @@ services:
   router:
     build: ..
     restart: unless-stopped
-    command: >
-      router
-      --holder seat-a=http://seat-a:8801
-      --holder seat-b=http://seat-b:8801
-      --holder seat-c=http://seat-c:8801
+    command: router --config /config/router.toml
     environment:
       CCPOOL_POOL_KEY: ${CCPOOL_POOL_KEY:?set in .env}
+      CCPOOL_ADMIN_KEY: ${CCPOOL_ADMIN_KEY:?set in .env}
       CCPOOL_INTERNAL_KEY: ${CCPOOL_INTERNAL_KEY:?set in .env}
+    volumes: ["./router.toml:/config/router.toml:ro"]
     ports: ["8787:8787"]
     networks: [pool]
 
+  # --- Team seats ------------------------------------------------------------
   seat-a:
     <<: *holder
     command: holder --name seat-a --oauth-file /seat/.credentials.json
     volumes: ["./seats/seat-a:/seat"]
-
   seat-b:
     <<: *holder
     command: holder --name seat-b --oauth-file /seat/.credentials.json
     volumes: ["./seats/seat-b:/seat"]
-
   seat-c:
     <<: *holder
     command: holder --name seat-c --oauth-file /seat/.credentials.json
     volumes: ["./seats/seat-c:/seat"]
+
+  # --- paid fallbacks ----------------------------------------------------------
+  api:
+    <<: *holder
+    command: holder --name api --kind api_key
+    environment:
+      <<: *holder-env
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:?set in .env}
+
+  bedrock:
+    <<: *holder
+    command: holder --name bedrock --kind bedrock --region ${AWS_REGION:-us-east-1}
+    environment:
+      <<: *holder-env
+      # Any standard AWS credential source works (env keys, a mounted profile,
+      # an instance/task role). A Bedrock API key also works:
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+      AWS_BEARER_TOKEN_BEDROCK: ${AWS_BEARER_TOKEN_BEDROCK:-}
+
+  litellm-holder:
+    <<: *holder
+    command: holder --name litellm --kind litellm --upstream ${LITELLM_URL:-http://litellm:4000}
+    environment:
+      <<: *holder-env
+      LITELLM_API_KEY: ${LITELLM_API_KEY:?set in .env}
 
 networks:
   pool: {}

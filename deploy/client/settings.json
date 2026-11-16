@@ -1,0 +1,10 @@
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://router:8787",
+    "ANTHROPIC_AUTH_TOKEN": "<CCPOOL_POOL_KEY>"
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "ccpool statusline --url http://router:8787"
+  }
+}

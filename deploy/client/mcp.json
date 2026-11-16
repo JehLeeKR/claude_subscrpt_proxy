@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "ccpool": {
+      "type": "http",
+      "url": "http://router:8787/mcp",
+      "headers": { "Authorization": "Bearer ${CCPOOL_ADMIN_KEY}" }
+    }
+  }
+}

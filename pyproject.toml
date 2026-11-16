@@ -5,13 +5,14 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "ccpool"
 version = "0.1.0"
-description = "Hold several logged-in Claude Team seats and spread Claude Code traffic across them by quota."
+description = "Pool Claude Team seats for Claude Code, with API / Bedrock / LiteLLM as paid fallback."
 requires-python = ">=3.11"
 license = { file = "LICENSE" }
 dependencies = ["aiohttp>=3.9"]
 
 [project.optional-dependencies]
-test = ["pytest>=8", "pytest-aiohttp>=1.0"]
+bedrock = ["anthropic[bedrock]>=2.8"]
+test = ["pytest>=8", "pytest-aiohttp>=1.0", "anthropic[bedrock]>=2.8"]
 
 [project.scripts]
 ccpool = "ccpool.__main__:main"

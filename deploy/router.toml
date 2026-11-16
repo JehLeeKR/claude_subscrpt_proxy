@@ -1,0 +1,44 @@
+# Router configuration. Mounted into the router container at /config/router.toml.
+
+[policy]
+# Move a session off its seat once 5h or 7d usage on that seat passes this fraction.
+switch_threshold = 0.90
+# When every seat is out of quota, use the paid backends below (in priority order).
+paid_fallback = true
+# Stop paid fallback after this much estimated spend per UTC day. Remove for no limit.
+paid_daily_budget_usd = 50.0
+
+# Subscription seats: always preferred while any has quota.
+[[backend]]
+name = "seat-a"
+url = "http://seat-a:8801"
+tier = "subscription"
+
+[[backend]]
+name = "seat-b"
+url = "http://seat-b:8801"
+tier = "subscription"
+
+[[backend]]
+name = "seat-c"
+url = "http://seat-c:8801"
+tier = "subscription"
+
+# Paid fallbacks: lower priority is tried first.
+[[backend]]
+name = "api"
+url = "http://api:8801"
+tier = "paid"
+priority = 0
+
+[[backend]]
+name = "bedrock"
+url = "http://bedrock:8801"
+tier = "paid"
+priority = 1
+
+[[backend]]
+name = "litellm"
+url = "http://litellm-holder:8801"
+tier = "paid"
+priority = 2
